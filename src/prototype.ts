@@ -19,11 +19,10 @@ export async function listWorktrees(repoCwd: string): Promise<Worktree[]> {
 	return trees;
 }
 
-/** Newest worktree on a `<prefix>` branch, preferring one whose branch is for this selection range. */
+/** The `<prefix>` worktree whose branch embeds this selection range, or undefined — never a guess. */
 export function pickPrototypeWorktree(trees: Worktree[], prefix: string, range: string): Worktree | undefined {
-	const candidates = trees.filter(t => t.branch.startsWith(prefix));
 	const tail = (t: Worktree) => t.branch.slice(prefix.length);
-	return candidates.find(t => tail(t) === range || tail(t).startsWith(`${range}-`)) ?? candidates[candidates.length - 1];
+	return trees.find(t => t.branch.startsWith(prefix) && (tail(t) === range || tail(t).startsWith(`${range}-`)));
 }
 
 export type Artifact = { rel: string; abs: string; image: boolean };
@@ -94,6 +93,15 @@ export function artifactComment(o: CommentInput): string {
 	].join("\n");
 }
 
-export async function commentOnIssues(cwd: string, numbers: number[], body: string): Promise<void> {
-	for (const n of numbers) await run(["gh", "issue", "comment", String(n), "--body", body], cwd);
+/** Comments on each issue in parallel; on partial failure names what succeeded and what failed. */
+export async function commentOnIssues(cwd: string, numbers: number[], body: string, runner: typeof run = run): Promise<void> {
+	const results = await Promise.allSettled(numbers.map(n => runner(["gh", "issue", "comment", String(n), "--body", body], cwd)));
+	const ok: number[] = [];
+	const failed: string[] = [];
+	results.forEach((r, i) => {
+		if (r.status === "fulfilled") ok.push(numbers[i]);
+		else failed.push(`failed on #${numbers[i]}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+	});
+	if (failed.length)
+		throw new CommandError([...(ok.length ? [`commented on ${ok.map(n => `#${n}`).join(", ")}`] : []), ...failed].join("; "));
 }

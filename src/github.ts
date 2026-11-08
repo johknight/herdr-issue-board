@@ -17,6 +17,9 @@ export type IssueDetail = {
 
 const gh = (cwd: string, args: string[]) => run(["gh", ...args], cwd);
 
+/** Hard cap on `gh issue list`; a hit means issues may be missing and the board must say so. */
+export const ISSUE_LIMIT = 500;
+
 export async function repoName(cwd: string): Promise<string> {
 	return (await gh(cwd, ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])).trim();
 }
@@ -28,7 +31,7 @@ export async function listIssues(cwd: string): Promise<Issue[]> {
 		"--state",
 		"open",
 		"--limit",
-		"500",
+		String(ISSUE_LIMIT),
 		"--json",
 		"number,title,url,labels,assignees,author,updatedAt",
 	]);

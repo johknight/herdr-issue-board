@@ -84,6 +84,9 @@ export async function startAgent(name: string, kind: string, pane: string): Prom
 }
 
 export async function promptAgent(target: string, text: string): Promise<void> {
+	// herdr's CLI has no "--" end-of-options marker, so a leading "-" is parsed as a flag.
+	if (text.startsWith("-"))
+		throw new CommandError(`prompt text must not start with '-' — herdr's CLI parses it as a flag; rephrase the prompt`);
 	await herdr(["agent", "prompt", target, text]);
 }
 

@@ -252,7 +252,9 @@ function renderBoard(L: Layout, rows: string[]) {
 	const { W, cw, visible, bodyH, perCol } = L;
 	const right = "space select · J/K extend · / slash · ⏎ details · m actions · r refresh · q quit";
 	const picked = selected.size ? ` · ${selected.size} selected` : "";
-	rows[0] = headerLine(W, ` ${repo || "…"} · ${issues.length} open${picked}`, right);
+	// "+": the gh issue list is capped at gh.ISSUE_LIMIT, so there may be hidden issues.
+	const capped = issues.length === gh.ISSUE_LIMIT;
+	rows[0] = headerLine(W, ` ${repo || "…"} · ${issues.length}${capped ? "+" : ""} open${picked}`, right);
 
 	const shown = columns.slice(colOffset, colOffset + visible);
 	const sep = dim("│");
@@ -397,7 +399,8 @@ async function loadIssues(quiet = false) {
 		buildColumns();
 		pruneSelection();
 		ensureVisible();
-		return `${issues.length} open issues · ${new Date().toLocaleTimeString()}`;
+		const capped = issues.length === gh.ISSUE_LIMIT ? ` · showing first ${gh.ISSUE_LIMIT} issues` : "";
+		return `${issues.length} open issues${capped} · ${new Date().toLocaleTimeString()}`;
 	};
 	if (quiet) {
 		try {
@@ -833,7 +836,7 @@ function attachPrototype() {
 	return act(`Attaching prototype to ${numbers.length} tickets`, async () => {
 		const trees = await proto.listWorktrees(repoCwd);
 		const wt = proto.pickPrototypeWorktree(trees, config.prototype.branchPrefix, range);
-		if (!wt) throw new Error(`no worktree on a "${config.prototype.branchPrefix}" branch in this repo`);
+		if (!wt) throw new Error(`no prototype worktree on a "${config.prototype.branchPrefix}${range}" branch in this repo`);
 		const artifacts = await proto.findArtifacts(wt.path, config.prototype.dir, config.prototype.artifactGlobs);
 		if (!artifacts.length) throw new Error(`no artefacts under ${config.prototype.dir}/ in ${wt.path}`);
 		await proto.publishArtifacts(wt, artifacts.map(a => a.rel), `prototype: #${range} artefacts`);
