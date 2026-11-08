@@ -1,8 +1,10 @@
-// Read-only adapter for the wb sandbox manager: pool worktrees, sessions and the repo's
-// `.wb.json`. Every entry point degrades silently — wb missing, non-git repo or malformed
-// data yield empty results, so the board renders exactly as it would without wb.
-import { accessSync, constants } from "node:fs";
+// Adapter for the wb sandbox manager: pool worktrees, sessions, the repo's `.wb.json` (batch 1)
+// and the launch-engine wiring of batch 2 — `wb start`/`wb publish`/`wb diff`/`wb finish` calls and
+// the launcher decisions. Reads degrade silently; action wrap `run()` and surface wb's own guards.
+import { accessSync, constants, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { listWorktrees, type Worktree } from "./prototype";
 import { run } from "./proc";
 
@@ -190,4 +192,144 @@ export async function loadPool(repoCwd: string): Promise<PoolTask[]> {
 			dirty: await hasTrackedChanges(wt.path),
 		})),
 	);
+}
+
+// ── launch engine (batch 2b: BR-10..BR-14) ──────────────────────────────────
+
+/**
+ * Launcher decision (BR-10): `herdr` (the default) never routes through wb; `wb` routes only when
+ * the wb surfaces are enabled and a `wb` sits on PATH — otherwise the actions fall back to herdr
+ * with a one-line notice, never a hard failure mid-selection.
+ */
+export function resolveLauncher(
+	launcher: "herdr" | "wb" | string,
+	enabled: boolean,
+	onPath: boolean,
+): { wb: boolean; notice: string | null } {
+	if (launcher !== "wb") return { wb: false, notice: null };
+	if (!enabled) return { wb: false, notice: "wb disabled in config — using the herdr launcher" };
+	if (!onPath) return { wb: false, notice: "wb not on PATH — using the herdr launcher" };
+	return { wb: true, notice: null };
+}
+
+/** Local pool branch of a task: `agent/tree-<task>` (tree mode) or `wb/<task>` (serial). */
+export function localBranchFor(task: string, mode: "tree" | "serial"): string {
+	return mode === "tree" ? `agent/tree-${task}` : `wb/${task}`;
+}
+
+/**
+ * Remote branch `wb publish` pushes a task to: `wb/tree-<task>` (tree mode) or `wb/<task>`
+ * (serial) — probed against `wb publish <task> --yes`, which renames `agent/tree-*` on push.
+ */
+export function remoteBranchFor(task: string, mode: "tree" | "serial"): string {
+	return mode === "tree" ? `wb/tree-${task}` : `wb/${task}`;
+}
+
+/** The wb task a card maps to: an exact `issue-<n>` pool task wins over a range/name task (BR-2). */
+export function taskForIssue(tasks: PoolTask[], issueNumber: number): PoolTask | undefined {
+	const exact = tasks.find(t => t.task === taskIdForIssue(issueNumber));
+	if (exact) return exact;
+	return tasks.find(t => t.issues.includes(issueNumber));
+}
+
+/** A `y`/`Y`/`yes` answer consents; the empty default and everything else declines (`[y/N]`). */
+export function consentAnswer(text: string): boolean {
+	return /^y(es)?$/i.test(text.trim());
+}
+
+/** `wb finish --json` result (BR-9): `sha` is the merge/squash commit, null on kill. */
+export type FinishResult = {
+	task: string;
+	action: string;
+	branch: string;
+	parent: string;
+	sha: string | null;
+	worktree: string;
+};
+
+/** The local lifeclose actions the board may run behind an explicit confirm (BR-14). */
+export type WbFinishAction = "merge" | "squash" | "kill";
+
+/**
+ * The result object out of `wb finish --json` stdout: human text first, the JSON object as the
+ * last line. Anything unparseable yields undefined (the board still reports success).
+ */
+export function parseFinishJson(stdout: string): FinishResult | undefined {
+	for (const line of stdout.split("\n").reverse()) {
+		const text = line.trim();
+		if (!text.startsWith("{")) continue;
+		try {
+			const json: unknown = JSON.parse(text);
+			if (!json || typeof json !== "object" || Array.isArray(json)) continue;
+			const o = json as Record<string, unknown>;
+			if (typeof o.task !== "string" || typeof o.action !== "string" || typeof o.branch !== "string" || typeof o.parent !== "string" || typeof o.worktree !== "string")
+				continue;
+			return { task: o.task, action: o.action, branch: o.branch, parent: o.parent, sha: typeof o.sha === "string" ? o.sha : null, worktree: o.worktree };
+		} catch {}
+	}
+	return undefined;
+}
+
+// Argv builders — pure, so tests pin the exact contracts (flag order, consent flags, and that
+// no push/delete flag ever reaches `wb finish`).
+
+/** `wb start <task>` argv (BR-11): task id, repo, agent, setup skipped, prompt from a temp file. */
+export function wbStartArgv(task: string, repoRoot: string, agent: string, promptFile: string): string[] {
+	return ["wb", "start", task, "--repo", repoRoot, agent, "--setup=skip", "--prompt-file", promptFile];
+}
+
+/** `wb publish <task>` argv (BR-12): `--yes` is the board's explicit push consent. */
+export function wbPublishArgv(task: string, repoRoot: string): string[] {
+	return ["wb", "publish", task, "--repo", repoRoot, "--yes"];
+}
+
+/** `wb diff <task>` argv (BR-14): read-only task diff for the Review overlay. */
+export function wbDiffArgv(task: string, repoRoot: string): string[] {
+	return ["wb", "diff", task, "--repo", repoRoot];
+}
+
+/**
+ * `wb finish <task> <action>` argv (BR-14): the consented local lifeclose. `--yes` never reaches
+ * wb's remote ask (TTY-gated off by wb's construction); the board passes nothing push-shaped.
+ */
+export function wbFinishArgv(task: string, repoRoot: string, action: WbFinishAction): string[] {
+	return ["wb", "finish", task, action, "--yes", "--json", "--repo", repoRoot];
+}
+
+/**
+ * Starts a sandboxed wb task with the prompt as the agent's first message. The prompt text goes
+ * to a temp file and only that path enters argv (BR-11); wb opens the workspace pane itself.
+ */
+export async function wbStart(task: string, repoRoot: string, agent: string, promptText: string): Promise<string> {
+	const promptFile = join(tmpdir(), `issue-board-prompt-${randomUUID()}.txt`);
+	await Bun.write(promptFile, promptText);
+	try {
+		return await run(wbStartArgv(task, repoRoot, agent, promptFile), repoRoot);
+	} finally {
+		try {
+			unlinkSync(promptFile);
+		} catch {}
+	}
+}
+
+/** Pushes the task branch to origin — the ONLY push path on the wb launcher, behind an explicit yes (BR-12). */
+export async function wbPublish(task: string, repoRoot: string): Promise<string> {
+	return run(wbPublishArgv(task, repoRoot), repoRoot);
+}
+
+/**
+ * The task's diff against its parent, for the read-only Review overlay (BR-14). `wb diff` derives
+ * the repo from the process directory (its `--repo` is silently ignored by the dispatch), so the
+ * spawn runs in `repoRoot`.
+ */
+export async function wbDiff(task: string, repoRoot: string): Promise<string> {
+	return run(wbDiffArgv(task, repoRoot), repoRoot);
+}
+
+/**
+ * Finishes a wb task locally (merge/squash into the parent branch, worktree teardown) and parses
+ * the BR-9 result; nonzero exits carry wb's own first stderr line via `run()`'s CommandError.
+ */
+export async function wbFinish(task: string, repoRoot: string, action: WbFinishAction): Promise<FinishResult | undefined> {
+	return parseFinishJson(await run(wbFinishArgv(task, repoRoot, action), repoRoot));
 }

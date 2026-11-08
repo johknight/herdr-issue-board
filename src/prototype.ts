@@ -49,14 +49,28 @@ export async function findArtifacts(repoRoot: string, dir: string, globs: string
 		.map(rel => ({ rel: join(dir, rel), abs: join(root, rel), image: IMAGE.test(rel) }));
 }
 
-/** Stages, commits (only when dirty) and pushes the given paths on the worktree's branch. */
-export async function publishArtifacts(wt: Worktree, rels: string[], message: string): Promise<void> {
+/**
+ * Stages and commits (only when dirty) the given paths on the worktree's branch — host-side git,
+ * no network, no push. The wb-launcher `/attach` commits here and pushes only via consented
+ * `wb publish` (BR-12).
+ */
+export async function commitArtifacts(wt: Worktree, rels: string[], message: string): Promise<void> {
 	if (!rels.length) return;
 	const dirty = (await run(["git", "status", "--porcelain", "--", ...rels], wt.path)).trim();
 	if (dirty) {
 		await run(["git", "add", "--", ...rels], wt.path);
 		await run(["git", "commit", "-m", message, "--", ...rels], wt.path);
 	}
+}
+
+/**
+ * Stages, commits (only when dirty) and pushes the given paths on the worktree's branch — the
+ * herdr-launcher legacy flow, kept verbatim (BR-12: under `launcher: "wb"` the board never
+ * pushes git itself; the only push path there is a consented `wb publish`).
+ */
+export async function publishArtifacts(wt: Worktree, rels: string[], message: string): Promise<void> {
+	if (!rels.length) return;
+	await commitArtifacts(wt, rels, message);
 	try {
 		await run(["git", "push", "-u", "origin", wt.branch], wt.path);
 	} catch (err) {
@@ -72,21 +86,27 @@ export type CommentInput = {
 	repo: string;
 	skill?: string;
 	numbers: number[];
+	/** false = branch is local-only: no raw-URL embeds (they would 404), file list only. */
+	pushed?: boolean;
 	artifacts: Artifact[];
 };
 
 export function artifactComment(o: CommentInput): string {
-	const shots = o.artifacts.filter(a => a.image).map(a => `![${basename(a.rel)}](${rawUrl(o.repo, o.branch, a.rel)})`);
+	const pushed = o.pushed ?? true;
+	const shots = pushed ? o.artifacts.filter(a => a.image).map(a => `![${basename(a.rel)}](${rawUrl(o.repo, o.branch, a.rel)})`) : [];
 	const files = o.artifacts.filter(a => !a.image).map(a => `- \`${a.rel}\``);
 	const how = o.skill
 		? `Generated with the \`/${o.skill}\` skill from the issue board`
 		: "Generated with the prototype skill from the issue board";
+	const inspect = pushed
+		? `Prototype branch: \`${o.branch}\` — inspect with \`git fetch origin && git checkout ${o.branch}\`.`
+		: `Prototype branch: \`${o.branch}\` — committed locally, not pushed to origin yet.`;
 	return [
 		"### Prototype preview",
 		"",
 		`${how} for ${o.numbers.map(n => `#${n}`).join(", ")}.`,
 		"",
-		`Prototype branch: \`${o.branch}\` — inspect with \`git fetch origin && git checkout ${o.branch}\`.`,
+		inspect,
 		"",
 		...(shots.length ? ["Screenshots of the prototype:", "", ...shots, ""] : []),
 		...(files.length ? ["Prototype files:", "", ...files, ""] : []),

@@ -45,7 +45,7 @@ The board opens as an overlay pane for the repo of the pane that had focus.
 | `S` | type a selection spec: `183-192`, `183,185`, `label:bug`, `@user`, `all`, `none` |
 | `/` | open the slash palette (`/report`, `/select`, `/attach`, then one entry per global skill) |
 | `⏎` | ticket detail (body + comments) |
-| `m`, `.`, right-click | action menu: implement in worktree / split pane, refine, slash, send to a running agent, move, browser |
+| `m`, `.`, right-click | action menu: implement in worktree / split pane, refine, slash, send to a running agent, move, browser (plus Review / Finish on wb-mapped cards under the wb launcher) |
 | `r` | reload issues (also every 2 minutes) |
 | `q` | quit |
 
@@ -108,6 +108,35 @@ selection always recomputes the same id). They resolve through pool branches `wb
 Hide both surfaces with `"wb": { "enabled": false }` — and when wb is not installed at all, the board
 behaves exactly as it does without this section.
 
+## wb as the launch engine
+
+With `"launcher": "wb"` the board hands its actions to wb instead of starting herdr agents itself:
+`Enter→Implement` (the `i` key) and `/<skill>` runs start sandboxed wb tasks on the derived task ids,
+so every agent lands in a pool worktree under wb's safehouse fence with the ticket prompt as its
+first message. Configured but wb missing from PATH? The actions fall back to the herdr launcher
+with a one-line notice — never a hard failure mid-selection.
+
+```json
+"wb": { "enabled": true, "launcher": "wb", "agent": "pi" }
+```
+
+- **Task ids** are the derived ones above (`issue-<n>` for implement, `issues-<range>-<skill>` for
+  a skill run), so `/attach` and the Review/Finish menu recompute the same task from the selection.
+- **Serial repos** cannot parallelise a fan-out: a multi-ticket `/<skill>` run on a `serial`-mode
+  repo is refused up front with a hint (`wb mode tree`); a single-ticket implement rotates the
+  serial worktree, and a dirty serial worktree surfaces wb's own abort line in the notice.
+- **`/attach`** commits dirty artefacts locally (host-side git, no network), then asks
+  `push <branch> to origin? [y/N]` — `y` pushes via consented `wb publish` (the only push path on
+  this launcher), `n` skips the push but still comments with the branch pointer and file list.
+- **Review / Finish** (card `m` menu, only on cards that map to a wb task): Review shows
+  `wb diff <task>` in a scrollable, read-only overlay; Finish picks `merge`, `squash` or `kill`
+  and asks an explicit confirm naming the consequence and the parent branch. The consented
+  `wb finish` is **local-only** — the task branch merges into the local parent and the worktree
+  is torn down; no push, no remote delete, ever (`wb publish` remains the only push path).
+
+Under the default `"launcher": "herdr"` the board's flow (worktrees, `slash/*` branches, the
+automatic `/attach` push) is unchanged.
+
 ## Configuration
 
 `$HERDR_PLUGIN_CONFIG_DIR/config.json` overlays the defaults (`columns` replaces, everything else merges):
@@ -121,7 +150,7 @@ behaves exactly as it does without this section.
   ],
   "skillDirs": ["~/.agents/skills"],
   "prototype": { "skill": "prototype", "branchPrefix": "slash/", "dir": "prototype" },
-  "wb": { "enabled": true },
+  "wb": { "enabled": true, "launcher": "wb", "agent": "pi" },
   "prompts": {
     "implement": "Implement GitHub issue #{number} in {repo}: \"{title}\" ({url})."
   }
@@ -141,7 +170,7 @@ Prompt placeholders — `implement`/`refine`: `{number} {title} {repo} {url} {br
 | `src/selection.ts` | selection-spec parsing, range labels |
 | `src/skills.ts` | `SKILL.md` discovery |
 | `src/prototype.ts` | worktree lookup, artefact publish, ticket comments |
-| `src/wb.ts` | read-only wb adapter: pool worktrees, sessions, `.wb.json`, task-id mapping |
+| `src/wb.ts` | wb adapter: pool worktrees, sessions, `.wb.json`, task-id mapping, launcher + `wb start/publish/diff/finish` wiring |
 | `src/github.ts` | `gh` wrappers (issues, labels, detail) |
 | `src/herdr.ts` | `herdr` CLI wrappers (panes, worktrees, agents) |
 | `src/proc.ts` | process + clipboard helpers |

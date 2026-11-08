@@ -4,7 +4,7 @@ import { basename, join } from "node:path";
 import { type ColumnSpec, type Config, fill, loadConfig } from "./config";
 import * as gh from "./github";
 import * as hd from "./herdr";
-import { copyToClipboard } from "./proc";
+import { copyToClipboard, run } from "./proc";
 import * as proto from "./prototype";
 import { ago, blocksToMarkdown, buildReport, type Block, reportPrompt } from "./report";
 import { parseSelectionSpec, rangeLabel } from "./selection";
@@ -158,6 +158,14 @@ let wbTasks: wb.PoolTask[] = [];
 let wbByIssue = new Map<number, wb.PoolTask>();
 /** Open `/wb` pool view (BR-4). */
 let wbView: WbView | null = null;
+/** BR-14 Review: the task diff rendered in a scrollable, read-only overlay. */
+let wbDiffView: { task: string; lines: string[]; scroll: number } | null = null;
+/**
+ * BR-12 consent context once `/attach` has committed locally: the consent prompt asks about
+ * pushing, and `finishAttach` (from the prompt's y/N) publishes via `wb publish` or comments only.
+ */
+let attachPending: { task: string; branch: string; remoteBranch: string; numbers: number[]; artifacts: proto.Artifact[] } | null =
+	null;
 
 // Hit-test tables rebuilt every render (0-based screen cells).
 let cardHits: (Rect & { col: number; row: number })[] = [];
@@ -384,6 +392,7 @@ function render() {
 	menuItemRows = [];
 	if (reportView) renderReport(L, rows);
 	else if (wbView) renderWbView(L, rows);
+	else if (wbDiffView) renderWbDiff(L, rows);
 	else if (detail) renderDetail(L, rows);
 	else renderBoard(L, rows);
 	if (input) {
@@ -465,12 +474,13 @@ async function loadSkills() {
 	}
 }
 
-/** Stores a fresh pool snapshot; the first task naming an issue wins the badge. */
+/** Stores a fresh pool snapshot; badges use the same task preference as the menus. */
 function applyWbPool(tasks: wb.PoolTask[]) {
 	wbTasks = tasks;
 	const map = new Map<number, wb.PoolTask>();
-	for (const t of tasks) {
-		for (const n of t.issues) if (!map.has(n)) map.set(n, t);
+	for (const n of new Set(tasks.flatMap(t => t.issues))) {
+		const t = wb.taskForIssue(tasks, n);
+		if (t) map.set(n, t);
 	}
 	wbByIssue = map;
 }
@@ -482,6 +492,15 @@ async function refreshWb() {
 		applyWbPool(await wb.loadPool(repoCwd));
 	} catch {}
 	render();
+}
+
+/**
+ * Launcher in effect for board actions (BR-10): config `wb.launcher` resolves against the enabled
+ * flag and the PATH probe — a configured wb launcher with wb missing falls back to herdr with a
+ * one-line notice instead of failing mid-selection.
+ */
+function launcher(): { wb: boolean; notice: string | null } {
+	return wb.resolveLauncher(config.wb.launcher, config.wb.enabled, wb.wbAvailable());
 }
 
 /** Agent names must be unique among live agents: `base`, then `base-2`, `base-3`, … */
@@ -508,8 +527,27 @@ async function launchNamed(base: string, pane: string, prompt: string, where = `
 
 const launch = (issue: gh.Issue, pane: string, prompt: string) => launchNamed(`issue-${issue.number}`, pane, prompt);
 
+/**
+ * `Enter→Implement` (the `i` key): under the wb launcher a sandboxed wb task starts on the BR-2
+ * task id and wb opens the workspace pane itself; herdr keeps the pre-bridge flow (BR-11), with
+ * a one-line notice when launcher "wb" fell back because wb is unavailable.
+ */
 function implementInWorktree(issue: gh.Issue) {
-	return act(`Creating worktree for #${issue.number}`, async () => {
+	const l = launcher();
+	if (!l.wb) return implementInWorktreeHerdr(issue, l.notice);
+	return act(`Starting wb task for #${issue.number}`, async () => {
+		const task = wb.taskIdForIssue(issue.number);
+		const mode = (await wb.wbRepoConfig(repoCwd)).mode === "serial" ? ("serial" as const) : ("tree" as const);
+		const branch = wb.localBranchFor(task, mode);
+		const prompt = `${promptFor("implement", issue, branch)} You are in a fresh git worktree on branch \`${branch}\`.`;
+		await wb.wbStart(task, repoCwd, config.wb.agent, prompt);
+		void refreshWb();
+		return `Started wb task ${task} (${config.wb.agent})`;
+	});
+}
+
+function implementInWorktreeHerdr(issue: gh.Issue, notice: string | null) {
+	return act(`Creating worktree for #${issue.number}${notice ? ` — ${notice}` : ""}`, async () => {
 		const branch = `issue/${issue.number}-${slug(issue.title)}`;
 		const pane = await hd.createWorktree(repoCwd, branch, `#${issue.number} ${truncate(issue.title, 24)}`);
 		const prompt = `${promptFor("implement", issue, branch)} You are in a fresh git worktree on branch \`${branch}\`.`;
@@ -568,12 +606,89 @@ function openBrowser(issue: gh.Issue) {
 	});
 }
 
+/**
+ * The wb task a card's action menu maps to (BR-14): only under the wb launcher, and only when the
+ * ticket maps onto a pool task (BR-2) — the herdr launcher hides Review/Finish entirely.
+ */
+function wbMenuTask(issue: gh.Issue): wb.PoolTask | undefined {
+	if (!launcher().wb) return undefined;
+	return wb.taskForIssue(wbTasks, issue.number);
+}
+
+/** BR-14 Review: the task's diff in a scrollable, read-only overlay (`wb diff`, the report-view precedent). */
+function reviewWbTask(t: wb.PoolTask) {
+	return act(`Diffing wb task ${t.task}`, async () => {
+		const out = await wb.wbDiff(t.task, repoCwd);
+		wbDiffView = { task: t.task, lines: clean(out).split("\n"), scroll: 0 };
+		return `wb diff ${t.task} — read-only`;
+	});
+}
+
+/** BR-14 Finish chooser: the local lifeclose action; the confirm then names consequence and parent. */
+function openFinishMenu(t: wb.PoolTask) {
+	const items: MenuItem[] = [
+		{ label: "merge · merge the task branch into its parent locally", run: () => confirmFinishWb(t, "merge") },
+		{ label: "squash · fold the task into one commit on its parent", run: () => confirmFinishWb(t, "squash") },
+		{ label: "kill · discard the task branch and its worktree", run: () => confirmFinishWb(t, "kill") },
+	];
+	const x = menuRect ? menuRect.x1 + 1 : 2;
+	menu = { title: `Finish ${t.task}`, items, index: 0, offset: 0, x, y: menuRect ? menuRect.y0 : BODY_TOP, parent: null };
+	render();
+}
+
+/** The repo root's checked-out branch — the parent a wb task branched from (task confirms name it). */
+async function headBranch(): Promise<string> {
+	try {
+		return (await run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repoCwd)).trim() || "parent branch";
+	} catch {
+		return "parent branch";
+	}
+}
+
+/**
+ * Explicit finish confirm (BR-14): names the action's consequence and the target/parent branch;
+ * only a `y` answer runs the local-only `wb finish` — anything else leaves everything untouched.
+ */
+async function confirmFinishWb(t: wb.PoolTask, action: wb.WbFinishAction) {
+	const parent = await headBranch();
+	const consequence =
+		action === "kill" ? `changes on ${t.branch} discarded, worktree deleted` : `${t.branch} merged into ${parent} locally, worktree deleted`;
+	input = {
+		label: `Finish ${t.task} — ${action}: ${consequence}. [y/N]`,
+		buffer: "",
+		apply: text => {
+			if (wb.consentAnswer(text)) void finishWbTask(t, action);
+			else setStatus(`Finish of ${t.task} cancelled — nothing changed`, YELLOW);
+		},
+	};
+	render();
+}
+
+/** The consented lifeclose: local merge/teardown via `wb finish --json`; the BR-9 result lands in the notice line. */
+function finishWbTask(t: wb.PoolTask, action: wb.WbFinishAction) {
+	return act(`Finishing ${t.task} (${action})`, async () => {
+		const result = await wb.wbFinish(t.task, repoCwd, action);
+		await refreshWb();
+		if (!result) return `Finished ${t.task} (${action})`;
+		return action === "kill"
+			? `Killed ${t.task} — ${result.branch} discarded, worktree deleted`
+			: `Finished ${t.task}: ${(result.sha ?? "").slice(0, 7)} on ${result.parent} (branch ${result.branch}, worktree deleted)`;
+	});
+}
+
 function issueMenu(issue: gh.Issue): MenuItem[] {
+	const wbTask = wbMenuTask(issue);
 	return [
 		{ label: "Implement in new worktree", run: () => implementInWorktree(issue) },
 		{ label: "Implement in split pane", run: () => launchInSplit(issue, "implement") },
 		{ label: "Refine ticket with agent", run: () => launchInSplit(issue, "refine") },
 		{ label: "Slash", submenu: () => slashItems() },
+		...(wbTask
+			? [
+					{ label: `Review · wb diff ${wbTask.task} (read-only)`, run: () => reviewWbTask(wbTask) },
+					{ label: `Finish · merge, squash or kill ${wbTask.task} locally`, run: () => openFinishMenu(wbTask) },
+				]
+			: []),
 		{
 			label: "Send to running agent",
 			submenu: async () => {
@@ -910,6 +1025,17 @@ function renderWbView(L: Layout, rows: string[]) {
 	for (let y = 0; y < bodyH; y++) rows[BODY_TOP + y] = ` ${lines[v.scroll + y] ?? ""}`;
 }
 
+/** BR-14 Review overlay: `wb diff` output, one line per screen row, strictly read-only. */
+function renderWbDiff(L: Layout, rows: string[]) {
+	const v = wbDiffView as NonNullable<typeof wbDiffView>;
+	const { W, bodyH } = L;
+	rows[0] = headerLine(W, ` wb diff · ${v.task}`, "read-only · j/k scroll · esc back");
+	rows[1] = dim(fit(` ${repo || "…"} · worktree diff against the parent branch`, W));
+	rows[2] = dim("─".repeat(W));
+	v.scroll = clamp(v.scroll, 0, Math.max(0, v.lines.length - bodyH));
+	for (let y = 0; y < bodyH; y++) rows[BODY_TOP + y] = ` ${truncate(v.lines[v.scroll + y] ?? "", W - 2)}`;
+}
+
 // ── skills: run in a fresh worktree, then publish the prototype back ────────
 
 /** Branch + prompt variables for a `/{skill}` run over the current selection. */
@@ -926,11 +1052,45 @@ function skillVars(skill: Skill) {
 	};
 }
 
-/** `/{skill}`: fresh worktree for the selected tickets, agent started with the skill prompt. */
-function runSkill(skill: Skill) {
+/**
+ * `/{skill}`: under the wb launcher one sandboxed wb task per run on the BR-2 id
+ * (`issues-<range>-<skill>`) — wb opens the pane and delivers the prompt (BR-11). A multi-ticket
+ * run on a serial repo is refused up front with a `wb mode tree` hint; a dirty serial worktree
+ * surfaces wb's own abort line (first stderr line of the nonzero exit) in the notice slot.
+ */
+async function runSkill(skill: Skill) {
 	const { picks, numbers, range, branch, list } = skillVars(skill);
 	if (!picks.length) return setStatus("Select tickets first (space or /select), then run a slash command", YELLOW);
+	const l = launcher();
+	if (!l.wb) return runSkillHerdr(skill, l.notice);
+	const mode = (await wb.wbRepoConfig(repoCwd)).mode === "serial" ? ("serial" as const) : ("tree" as const);
+	if (mode === "serial" && numbers.length > 1)
+		return setStatus(`Refused: serial wb repo cannot fan out over ${numbers.length} tickets — run \`wb mode tree\``, YELLOW);
 	return act(`Running /${skill.name} on ${numbers.length} tickets`, async () => {
+		const task = wb.taskIdForSkill(numbers, slug(skill.name));
+		const taskBranch = wb.localBranchFor(task, mode);
+		const prompt = fill(config.prompts.skill, {
+			skill: skill.name,
+			skillPath: skill.path,
+			count: numbers.length,
+			repo,
+			tickets: numbers.map(n => `#${n}`).join(", "),
+			list,
+			branch: taskBranch,
+			range,
+			extra: skill.name === config.prototype.skill ? config.prompts.prototypeExtra : "",
+		});
+		await wb.wbStart(task, repoCwd, config.wb.agent, prompt);
+		void refreshWb();
+		return `Started wb task ${task} (${config.wb.agent})`;
+	});
+}
+
+/** The herdr-launcher `/{skill}` flow, kept verbatim (fallback carries the wb-unavailable notice). */
+function runSkillHerdr(skill: Skill, notice: string | null) {
+	const { picks, numbers, range, branch, list } = skillVars(skill);
+	if (!picks.length) return setStatus("Select tickets first (space or /select), then run a slash command", YELLOW);
+	return act(`Running /${skill.name} on ${numbers.length} tickets${notice ? ` — ${notice}` : ""}`, async () => {
 		const pane = await hd.createWorktree(repoCwd, branch, `#${range} ${skill.name}`);
 		const prompt = fill(config.prompts.skill, {
 			skill: skill.name,
@@ -948,13 +1108,57 @@ function runSkill(skill: Skill) {
 	});
 }
 
-/** `/attach`: publish the prototype worktree's artefacts and comment them onto the tickets. */
+/**
+ * `/attach` (BR-12): under the wb launcher this recomputes the BR-2 task id, finds the pool
+ * worktree for it, commits dirty artefacts locally (no network), then asks `push <branch> to
+ * origin? [y/N]` — yes pushes via consented `wb publish` (the only push path), no comments with
+ * the branch pointer anyway. Under herdr the legacy `slash/*` flow runs verbatim.
+ */
 function attachPrototype() {
 	const picks = pickedIssues(false);
 	if (!picks.length) return setStatus("Select the tickets the prototype was generated for", YELLOW);
 	const numbers = picks.map(i => i.number);
-	const range = rangeLabel(numbers);
+	const l = launcher();
+	if (!l.wb) return attachPrototypeHerdr(numbers, l.notice);
+	const taskId = wb.taskIdForSkill(numbers, slug(config.prototype.skill));
 	return act(`Attaching prototype to ${numbers.length} tickets`, async () => {
+		const pool = await wb.loadPool(repoCwd);
+		const t = pool.find(p => p.task === taskId);
+		if (!t) throw new Error(`no wb task \`${taskId}\` — run /${config.prototype.skill} on these tickets first`);
+		const artifacts = await proto.findArtifacts(t.path, config.prototype.dir, config.prototype.artifactGlobs);
+		if (!artifacts.length) throw new Error(`no artefacts under ${config.prototype.dir}/ in ${t.path}`);
+		await proto.commitArtifacts(t, artifacts.map(a => a.rel), `prototype: #${rangeLabel(numbers)} artefacts`);
+		const remoteBranch = wb.remoteBranchFor(t.task, t.mode);
+		attachPending = { task: t.task, branch: t.branch, remoteBranch, numbers, artifacts };
+		input = { label: `push ${remoteBranch} to origin? [y/N]`, buffer: "", apply: text => void finishAttach(wb.consentAnswer(text)) };
+		return `Committed ${artifacts.length} artefact${artifacts.length === 1 ? "" : "s"} on ${t.branch} — push consent below`;
+	});
+}
+
+/** Consent resolved: yes → `wb publish` then comment; no → comment only, nothing pushed. */
+function finishAttach(consent: boolean) {
+	const a = attachPending;
+	attachPending = null;
+	if (!a) return setStatus("Nothing to attach", YELLOW);
+	return act(`${consent ? "Publishing" : "Commenting"} prototype for ${a.numbers.length} tickets`, async () => {
+		if (consent) await wb.wbPublish(a.task, repoCwd);
+		const repoTarget = await gh.repoName(repoCwd);
+		await proto.commentOnIssues(
+			repoCwd,
+			a.numbers,
+			proto.artifactComment({ branch: consent ? a.remoteBranch : a.branch, repo: repoTarget, skill: config.prototype.skill, numbers: a.numbers, artifacts: a.artifacts, pushed: consent }),
+		);
+		const shots = a.artifacts.filter(x => x.image).length;
+		return consent
+			? `Commented on ${a.numbers.length} tickets (${a.remoteBranch} pushed via wb publish, ${shots} screenshots)`
+			: `Commented on ${a.numbers.length} tickets (${a.branch} committed locally, not pushed, ${shots} screenshots)`;
+	});
+}
+
+/** The herdr-launcher `/attach` flow, kept verbatim (BR-12 legacy path). */
+function attachPrototypeHerdr(numbers: number[], notice: string | null) {
+	const range = rangeLabel(numbers);
+	return act(`Attaching prototype to ${numbers.length} tickets${notice ? ` — ${notice}` : ""}`, async () => {
 		const trees = await proto.listWorktrees(repoCwd);
 		const wt = proto.pickPrototypeWorktree(trees, config.prototype.branchPrefix, range);
 		if (!wt) throw new Error(`no prototype worktree on a "${config.prototype.branchPrefix}${range}" or "${config.prototype.branchPrefix}${range}-<skill>" branch in this repo`);
@@ -1033,6 +1237,18 @@ function onKey(key: string) {
 		else if (key === "g" || key === "home") v.scroll = 0;
 		else if (key === "G" || key === "end") v.scroll = Number.MAX_SAFE_INTEGER;
 		else if (key === "r") return void loadWbView();
+		return render();
+	}
+	if (wbDiffView) {
+		const v = wbDiffView;
+		const page = Math.max(1, layout().bodyH - 2);
+		if (key === "esc" || key === "q" || key === "backspace" || key === "h" || key === "left") wbDiffView = null;
+		else if (key === "down" || key === "j") v.scroll++;
+		else if (key === "up" || key === "k") v.scroll--;
+		else if (key === "pgdn" || key === " ") v.scroll += page;
+		else if (key === "pgup") v.scroll -= page;
+		else if (key === "g" || key === "home") v.scroll = 0;
+		else if (key === "G" || key === "end") v.scroll = Number.MAX_SAFE_INTEGER;
 		return render();
 	}
 	if (detail) {
@@ -1126,6 +1342,10 @@ function onMouse(button: number, x: number, y: number) {
 			wbView.scroll += wheel * 3;
 			return render();
 		}
+		if (wbDiffView) {
+			wbDiffView.scroll += wheel * 3;
+			return render();
+		}
 		if (detail) {
 			detail.scroll += wheel * 3;
 			return render();
@@ -1152,6 +1372,7 @@ function onMouse(button: number, x: number, y: number) {
 
 	if (reportView) return;
 	if (wbView) return;
+	if (wbDiffView) return;
 	if (detail) {
 		if (btn === 2) openMenu(detail.issue, x, y);
 		return;

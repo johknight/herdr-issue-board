@@ -16,11 +16,16 @@ export type PrototypeConfig = {
 };
 
 /**
- * wb (sandbox manager) visibility: the `▣` card badge and the `/wb` pool view are read-only
- * surfaces; both hide when `enabled` is false (and when wb is not installed at all).
+ * wb (sandbox manager) visibility and launch engine. `enabled` gates the read-only surfaces (the
+ * `▣` card badge, the `/wb` pool view); `launcher` picks the engine for board actions — `herdr`
+ * (default, unchanged upstream flow) or `wb` (agents start sandboxed via `wb start`); `agent` is
+ * the wb argv agent used under `launcher: "wb"` (`omp` is a herdr kind, not a wb agent — the
+ * config, not a translation table, decides).
  */
 export type WbConfig = {
 	enabled: boolean;
+	launcher: "herdr" | "wb";
+	agent: string;
 };
 
 export type Config = {
@@ -72,6 +77,8 @@ const DEFAULTS: Config = {
 	},
 	wb: {
 		enabled: true,
+		launcher: "herdr",
+		agent: "pi",
 	},
 };
 
