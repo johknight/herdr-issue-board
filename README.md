@@ -62,6 +62,8 @@ own `.agents/skills` and `.claude/skills`). The same list is on a card's `Slash`
   `a` hands the prompt to a new or running agent, `/` switches skill.
 - `/select` — the `S` selection prompt.
 - `/attach` — the prototype hand-off below.
+- `/wb` — when the [wb](https://github.com/johknight/agent-workbench) sandbox manager is installed: a read-only
+  pool overview (see below). The entry hides itself entirely when wb is not on PATH.
 - `/<skill>` — starts that skill on the **selected tickets**: creates a worktree on
   `slash/<range>-<skill>`, starts a herdr agent in it and prompts it with the skill, the ticket list
   and the branch, so the agent keeps every artefact there and leaves `main` alone.
@@ -86,6 +88,26 @@ Screenshots are linked as `raw.githubusercontent.com` URLs, which GitHub's image
 from a public repo — on a private repo the comment lands with the branch pointer and file list but the
 inline images stay blank.
 
+## wb visibility
+
+When the [wb](https://github.com/johknight/agent-workbench) sandbox manager is installed, the board shows
+its pool read-only — wb stays the execution engine, the board only watches:
+
+- **Card badge** — `▣` on a ticket with a wb pool worktree, `▣●` when that worktree also has
+  uncommitted tracked changes. Refreshed on the board's cycle (`r` and every 2 minutes), after the
+  live agent badge.
+- **`/wb`** — a report-style pool overview, per task: id, branch, engine (from the repo's
+  `.wb.json`, `?` when unset), session count and a dirty marker. The footer prints the host commands
+  you would run next (`wb diff <task>`, `wb finish <task>`) — printed, never executed.
+
+Ticket ↔ task ids are derived, not configured: `issue-<n>` for a single ticket, `issues-<numbers>-<skill>`
+for a skill run over a selection (`issues-183-192-prototype`, `issues-183-185-190-refine` — the same
+selection always recomputes the same id). They resolve through pool branches `wb/<task>` and
+`agent/tree-<task>`; tasks without an issue number (`hello-world`) appear in `/wb` but never on a card.
+
+Hide both surfaces with `"wb": { "enabled": false }` — and when wb is not installed at all, the board
+behaves exactly as it does without this section.
+
 ## Configuration
 
 `$HERDR_PLUGIN_CONFIG_DIR/config.json` overlays the defaults (`columns` replaces, everything else merges):
@@ -99,6 +121,7 @@ inline images stay blank.
   ],
   "skillDirs": ["~/.agents/skills"],
   "prototype": { "skill": "prototype", "branchPrefix": "slash/", "dir": "prototype" },
+  "wb": { "enabled": true },
   "prompts": {
     "implement": "Implement GitHub issue #{number} in {repo}: \"{title}\" ({url})."
   }
@@ -118,6 +141,7 @@ Prompt placeholders — `implement`/`refine`: `{number} {title} {repo} {url} {br
 | `src/selection.ts` | selection-spec parsing, range labels |
 | `src/skills.ts` | `SKILL.md` discovery |
 | `src/prototype.ts` | worktree lookup, artefact publish, ticket comments |
+| `src/wb.ts` | read-only wb adapter: pool worktrees, sessions, `.wb.json`, task-id mapping |
 | `src/github.ts` | `gh` wrappers (issues, labels, detail) |
 | `src/herdr.ts` | `herdr` CLI wrappers (panes, worktrees, agents) |
 | `src/proc.ts` | process + clipboard helpers |

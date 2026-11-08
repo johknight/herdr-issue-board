@@ -15,6 +15,14 @@ export type PrototypeConfig = {
 	artifactGlobs: string[];
 };
 
+/**
+ * wb (sandbox manager) visibility: the `▣` card badge and the `/wb` pool view are read-only
+ * surfaces; both hide when `enabled` is false (and when wb is not installed at all).
+ */
+export type WbConfig = {
+	enabled: boolean;
+};
+
 export type Config = {
 	/** herdr agent kind started for new tickets (`herdr agent start --kind`). */
 	agent: string;
@@ -27,6 +35,7 @@ export type Config = {
 	/** Skill roots scanned for SKILL.md files; defaults to the shared agent skill dirs. */
 	skillDirs?: string[];
 	prototype: PrototypeConfig;
+	wb: WbConfig;
 };
 
 const DEFAULTS: Config = {
@@ -61,6 +70,9 @@ const DEFAULTS: Config = {
 		dir: "prototype",
 		artifactGlobs: ["**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.webp", "**/*.gif", "**/*.html"],
 	},
+	wb: {
+		enabled: true,
+	},
 };
 
 /** Loads `$HERDR_PLUGIN_CONFIG_DIR/config.json` over the defaults; `columns` replaces, the rest merges. */
@@ -76,6 +88,7 @@ export async function loadConfig(): Promise<Config> {
 		prompts: { ...DEFAULTS.prompts, ...user.prompts },
 		skillDirs: user.skillDirs ?? DEFAULTS.skillDirs,
 		prototype: { ...DEFAULTS.prototype, ...user.prototype },
+		wb: { ...DEFAULTS.wb, ...user.wb },
 	};
 }
 

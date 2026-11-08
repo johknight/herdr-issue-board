@@ -1,6 +1,6 @@
 // Kanban board of a repo's open GitHub issues, rendered as a full-screen terminal app inside a herdr pane.
 // Columns come from labels (config.ts). Right-click or `m` on a card opens actions that hand the ticket to agents.
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { type ColumnSpec, type Config, fill, loadConfig } from "./config";
 import * as gh from "./github";
 import * as hd from "./herdr";
@@ -9,6 +9,7 @@ import * as proto from "./prototype";
 import { ago, blocksToMarkdown, buildReport, type Block, reportPrompt } from "./report";
 import { parseSelectionSpec, rangeLabel } from "./selection";
 import { discoverSkills, type Skill } from "./skills";
+import * as wb from "./wb";
 
 const repoCwd = process.env.ISSUE_BOARD_CWD ?? process.cwd();
 const originPane = process.env.ISSUE_BOARD_ORIGIN_PANE;
@@ -113,6 +114,17 @@ type MenuItem = {
 };
 type Menu = { title: string; items: MenuItem[]; index: number; offset: number; x: number; y: number; parent: Menu | null };
 type Detail = { issue: gh.Issue; data: gh.IssueDetail | null; error: string | null; scroll: number };
+/** `/wb` state: the pool snapshot the read-only view renders, plus its scroll. */
+type WbView = {
+	tasks: wb.PoolTask[];
+	/** Engine key from the repo's `.wb.json`; `?` when unset. */
+	engine: string;
+	/** Session counts, parallel to `tasks`. */
+	counts: number[];
+	loading: boolean;
+	error: string | null;
+	scroll: number;
+};
 type Rect = { x0: number; y0: number; x1: number; y1: number };
 
 let config: Config;
@@ -134,6 +146,18 @@ let skills: Skill[] = [];
 let reportView: { blocks: Block[]; scroll: number; skill?: Skill; issues: gh.Issue[]; repo: string } | null = null;
 /** Inline one-line text prompt shown in the status row while active. */
 let input: { label: string; buffer: string; apply: (text: string) => void } | null = null;
+
+// ── wb (sandbox manager) read-only surfaces ─────────────────────────────────
+// Both degrade silently: when `wbReady` is false, no badge renders, `/wb` leaves the
+// palette, and a failed refresh keeps the last-known pool instead of breaking the board.
+
+/** wb surfaces are on: config allows them and a `wb` executable sits on PATH. */
+let wbReady = false;
+/** Pool snapshot behind the card badges; refreshed on the issue cycle, never awaited by render. */
+let wbTasks: wb.PoolTask[] = [];
+let wbByIssue = new Map<number, wb.PoolTask>();
+/** Open `/wb` pool view (BR-4). */
+let wbView: WbView | null = null;
 
 // Hit-test tables rebuilt every render (0-based screen cells).
 let cardHits: (Rect & { col: number; row: number })[] = [];
@@ -234,14 +258,18 @@ function cardLines(issue: gh.Issue, cw: number, cursor: boolean, marked: boolean
 		: bold(fit(t1, inner));
 
 	const agent = agentFor(issue);
-	const badge = agent ? `◆ ${agent.status} ` : "";
+	const wbTask = wbReady ? wbByIssue.get(issue.number) : undefined;
+	const agentBadge = agent ? `◆ ${agent.status} ` : "";
+	const wbBadge = wbTask ? (wbTask.dirty ? `▣● ` : `▣ `) : "";
+	const badge = `${agentBadge}${wbBadge}`;
 	const columnSet = new Set(columnLabels());
 	const meta = [
 		...issue.assignees.map(a => `@${a}`),
 		...issue.labels.filter(l => !columnSet.has(l)),
 		ago(issue.updatedAt),
 	].join(" · ");
-	const line3 = (agent ? fg(statusColor(agent.status), badge) : "") + dim(fit(meta, inner - width(badge)));
+	const badgeStyles = (agent ? fg(statusColor(agent.status), agentBadge) : "") + (wbTask ? fg(YELLOW, wbBadge) : "");
+	const line3 = badgeStyles + dim(fit(meta, inner - width(badge)));
 
 	const pre = cursor ? INV : "";
 	const mark = marked ? fg(MAGENTA, "▌") : " ";
@@ -355,6 +383,7 @@ function render() {
 	menuRect = null;
 	menuItemRows = [];
 	if (reportView) renderReport(L, rows);
+	else if (wbView) renderWbView(L, rows);
 	else if (detail) renderDetail(L, rows);
 	else renderBoard(L, rows);
 	if (input) {
@@ -434,6 +463,25 @@ async function loadSkills() {
 		// Skill discovery is optional; an unreadable dir must not hide why `/` is empty.
 		setStatus(`Skill scan failed: ${err instanceof Error ? err.message : String(err)}`, YELLOW);
 	}
+}
+
+/** Stores a fresh pool snapshot; the first task naming an issue wins the badge. */
+function applyWbPool(tasks: wb.PoolTask[]) {
+	wbTasks = tasks;
+	const map = new Map<number, wb.PoolTask>();
+	for (const t of tasks) {
+		for (const n of t.issues) if (!map.has(n)) map.set(n, t);
+	}
+	wbByIssue = map;
+}
+
+/** Reloads the wb pool behind the card badges; failures keep the last-known snapshot. */
+async function refreshWb() {
+	if (!wbReady) return;
+	try {
+		applyWbPool(await wb.loadPool(repoCwd));
+	} catch {}
+	render();
 }
 
 /** Agent names must be unique among live agents: `base`, then `base-2`, `base-3`, … */
@@ -668,6 +716,7 @@ function slashItems(): MenuItem[] {
 		{ label: "/report · local summary of the selection", run: () => openReport(undefined) },
 		{ label: "/select · pick tickets by range, label or assignee", run: () => openSelectPrompt() },
 		{ label: "/attach · post prototype screenshots on the tickets", run: () => attachPrototype() },
+		...(wbReady ? [{ label: "/wb · read-only overview of the wb pool", run: () => openWbView() }] : []),
 		{ label: `${skills.length} global skills`, disabled: true },
 		...skills.map(s => ({
 			label: `/${s.name}${s.description ? ` · ${truncate(s.description, 44)}` : ""}`,
@@ -798,6 +847,69 @@ function reportInSplit(text: string) {
 	});
 }
 
+// ── /wb: read-only pool view ────────────────────────────────────────────────
+
+/** `/wb`: a report-style, read-only look at the focused repo's wb pool. */
+function openWbView() {
+	wbView = { tasks: wbTasks, engine: "?", counts: wbTasks.map(() => 0), loading: true, error: null, scroll: 0 };
+	menu = null;
+	render();
+	void loadWbView();
+}
+
+/** Fills the `/wb` view: pool tasks, `.wb.json` engine, per-task session counts. */
+async function loadWbView() {
+	const v = wbView;
+	if (!v) return;
+	v.loading = true;
+	render();
+	try {
+		const [tasks, sessions, cfg] = await Promise.all([wb.loadPool(repoCwd), wb.wbSessions(), wb.wbRepoConfig(repoCwd)]);
+		applyWbPool(tasks);
+		v.tasks = tasks;
+		v.counts = tasks.map(t => wb.sessionsForTask(sessions, t, basename(repoCwd)));
+		v.engine = cfg.engine ?? "?";
+		v.error = null;
+	} catch (err) {
+		v.error = err instanceof Error ? err.message : String(err);
+	}
+	v.loading = false;
+	render();
+}
+
+/** Body lines of the `/wb` view; empty pool degrades to a one-line note. */
+function wbViewLines(v: WbView, w: number): string[] {
+	if (v.error) return [fg(RED, v.error)];
+	if (v.loading) return [dim("Loading…")];
+	if (!v.tasks.length) return [dim("wb not found / repo not in the wb pool")];
+	const out: string[] = [];
+	v.tasks.forEach((t, i) => {
+		out.push(...wrap(clean(t.task), w).map(bold));
+		const meta = [
+			t.branch,
+			`engine ${v.engine}`,
+			`${v.counts[i]} session${v.counts[i] === 1 ? "" : "s"}`,
+			...(t.dirty ? ["● dirty"] : []),
+		].join(" · ");
+		out.push(...wrap(clean(meta), w).map(dim));
+	});
+	const next = v.tasks[0].task;
+	out.push("", ...wrap(`next: wb diff ${next} · wb finish ${next} (host commands — the board never runs them)`, w).map(dim));
+	return out;
+}
+
+function renderWbView(L: Layout, rows: string[]) {
+	const v = wbView as WbView;
+	const { W, bodyH } = L;
+	const right = "r reload · j/k scroll · esc back";
+	rows[0] = headerLine(W, ` wb pool · ${v.tasks.length} task${v.tasks.length === 1 ? "" : "s"}`, right);
+	rows[1] = dim(fit(` ${repo || "…"} · engine ${v.engine} · read-only`, W));
+	rows[2] = dim("─".repeat(W));
+	const lines = wbViewLines(v, W - 2);
+	v.scroll = clamp(v.scroll, 0, Math.max(0, lines.length - bodyH));
+	for (let y = 0; y < bodyH; y++) rows[BODY_TOP + y] = ` ${lines[v.scroll + y] ?? ""}`;
+}
+
 // ── skills: run in a fresh worktree, then publish the prototype back ────────
 
 /** Branch + prompt variables for a `/{skill}` run over the current selection. */
@@ -910,6 +1022,19 @@ function onKey(key: string) {
 		else if (key === "a" || key === "m" || key === ".") return openReportAgentMenu();
 		return render();
 	}
+	if (wbView) {
+		const v = wbView;
+		const page = Math.max(1, layout().bodyH - 2);
+		if (key === "esc" || key === "q" || key === "backspace" || key === "h" || key === "left") wbView = null;
+		else if (key === "down" || key === "j") v.scroll++;
+		else if (key === "up" || key === "k") v.scroll--;
+		else if (key === "pgdn" || key === " ") v.scroll += page;
+		else if (key === "pgup") v.scroll -= page;
+		else if (key === "g" || key === "home") v.scroll = 0;
+		else if (key === "G" || key === "end") v.scroll = Number.MAX_SAFE_INTEGER;
+		else if (key === "r") return void loadWbView();
+		return render();
+	}
 	if (detail) {
 		const page = Math.max(1, layout().bodyH - 2);
 		if (key === "esc" || key === "q" || key === "backspace" || key === "h" || key === "left") detail = null;
@@ -952,6 +1077,7 @@ function onKey(key: string) {
 		case "end":
 			return moveSel(0, Number.MAX_SAFE_INTEGER);
 		case "r":
+			if (wbReady) void refreshWb();
 			return void loadIssues();
 		case "enter":
 			return issue && openDetail(issue);
@@ -996,6 +1122,10 @@ function onMouse(button: number, x: number, y: number) {
 			reportView.scroll += wheel * 3;
 			return render();
 		}
+		if (wbView) {
+			wbView.scroll += wheel * 3;
+			return render();
+		}
 		if (detail) {
 			detail.scroll += wheel * 3;
 			return render();
@@ -1021,6 +1151,7 @@ function onMouse(button: number, x: number, y: number) {
 	}
 
 	if (reportView) return;
+	if (wbView) return;
 	if (detail) {
 		if (btn === 2) openMenu(detail.issue, x, y);
 		return;
@@ -1082,6 +1213,7 @@ function quit(): never {
 
 config = await loadConfig();
 buildColumns();
+wbReady = config.wb.enabled && wb.wbAvailable();
 if (selfPane) hd.routeRightClickToPane(selfPane).catch(() => {});
 process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J");
 process.stdin.setRawMode(true);
@@ -1096,5 +1228,9 @@ render();
 void loadIssues();
 void refreshAgents();
 void loadSkills();
+if (wbReady) void refreshWb();
 setInterval(refreshAgents, 3000);
-setInterval(() => void loadIssues(true), 120_000);
+setInterval(() => {
+	void loadIssues(true);
+	if (wbReady) void refreshWb();
+}, 120_000);
