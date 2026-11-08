@@ -27,7 +27,7 @@ Bind a key in `~/.config/herdr/config.toml`:
 [[keys.command]]
 key = "prefix+i"
 type = "plugin_action"
-command = "jauki.issue-board.open"
+command = "johknight.issue-board.open"
 description = "issue board"
 ```
 

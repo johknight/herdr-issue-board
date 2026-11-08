@@ -119,7 +119,7 @@ export async function routeRightClickToPane(pane: string): Promise<void> {
 }
 
 export async function openBoardPane(env: Record<string, string>): Promise<void> {
-	const pluginId = process.env.HERDR_PLUGIN_ID ?? "jauki.issue-board";
+	const pluginId = process.env.HERDR_PLUGIN_ID ?? "johknight.issue-board";
 	const args = ["plugin", "pane", "open", "--plugin", pluginId, "--entrypoint", "board", "--focus"];
 	for (const [key, value] of Object.entries(env)) args.push("--env", `${key}=${value}`);
 	await herdr(args);

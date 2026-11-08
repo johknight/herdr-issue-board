@@ -1,11 +1,11 @@
-id = "jauki.issue-board"
+id = "johknight.issue-board"
 name = "Issue Board"
 version = "0.2.0"
 min_herdr_version = "0.9.0"
 description = "Kanban board of the focused repo's GitHub issues; multi-select tickets, drive agent skills from a slash palette, hand prototypes back to tickets"
 platforms = ["linux", "macos"]
 
-# Bind with:  [[keys.command]] key = "prefix+i"  type = "plugin_action"  command = "jauki.issue-board.open"
+# Bind with:  [[keys.command]] key = "prefix+i"  type = "plugin_action"  command = "johknight.issue-board.open"
 [[actions]]
 id = "open"
 title = "Open issue board"
