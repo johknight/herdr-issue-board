@@ -62,7 +62,7 @@ own `.agents/skills` and `.claude/skills`). The same list is on a card's `Slash`
   `a` hands the prompt to a new or running agent, `/` switches skill.
 - `/select` — the `S` selection prompt.
 - `/attach` — the prototype hand-off below.
-- `/wb` — when the [wb](https://github.com/johknight/agent-workbench) sandbox manager is installed: a read-only
+- `/wb` — when the `wb` sandbox manager is installed: a read-only
   pool overview (see below). The entry hides itself entirely when wb is not on PATH.
 - `/<skill>` — starts that skill on the **selected tickets**: creates a worktree on
   `slash/<range>-<skill>`, starts a herdr agent in it and prompts it with the skill, the ticket list
@@ -90,7 +90,7 @@ inline images stay blank.
 
 ## wb visibility
 
-When the [wb](https://github.com/johknight/agent-workbench) sandbox manager is installed, the board shows
+When the `wb` sandbox manager is installed, the board shows
 its pool read-only — wb stays the execution engine, the board only watches:
 
 - **Card badge** — `▣` on a ticket with a wb pool worktree, `▣●` when that worktree also has
