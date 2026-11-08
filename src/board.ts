@@ -245,7 +245,7 @@ function cardLines(issue: gh.Issue, cw: number, cursor: boolean, marked: boolean
 
 	const pre = cursor ? INV : "";
 	const mark = marked ? fg(MAGENTA, "▌") : " ";
-	return [line1, fit(t2, inner), line3].map(l => `${pre}${mark} ${l}${pre} ${RESET}`);
+	return [line1, fit(t2, inner), line3].map(l => `${pre}${mark} ${l}${RESET}`);
 }
 
 function renderBoard(L: Layout, rows: string[]) {
