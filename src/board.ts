@@ -632,6 +632,14 @@ function wbMenuTask(issue: gh.Issue): wb.PoolTask | undefined {
 	return wb.taskForIssue(wbTasks, issue.number);
 }
 
+/**
+ * The wb pool task behind a card's badge — the same mapping the badge renders (wb enabled +
+ * on PATH + issue→worktree), never launcher-gated: the open-task action rides the badge path.
+ */
+function wbBadgeTask(issue: gh.Issue): wb.PoolTask | undefined {
+	return wbReady ? wbByIssue.get(issue.number) : undefined;
+}
+
 /** BR-14 Review: the task's diff in a scrollable, read-only overlay (`wb diff`, the report-view precedent). */
 function reviewWbTask(t: wb.PoolTask) {
 	return act(`Diffing wb task ${t.task}`, async () => {
@@ -693,13 +701,45 @@ function finishWbTask(t: wb.PoolTask, action: wb.WbFinishAction) {
 	});
 }
 
+/**
+ * Card action: open the task's pool worktree with its agent-session tabs in the workbench
+ * herdr session (`wb up`, non-interactive). A down session boots first — a `wb-session` split
+ * pane runs `herdr session attach workbench` in the pane's own TTY, then a bounded wait polls
+ * the session server up before `wb up` runs (it no-ops silently while the session is down).
+ * Serial pools open the shared `serial` worktree, where serial-task sessions live.
+ */
+function openInWorkbenchSession(t: wb.PoolTask) {
+	const target = wb.wbUpTarget(t);
+	return act(`Opening ${t.task} in the workbench session`, async () => {
+		let booted = false;
+		if (!(await hd.sessionServerRunning("workbench"))) {
+			if (!originPane) throw new Error("no origin pane to split (open the board via its action)");
+			setStatus("Workbench session down — booting it in a wb-session split pane…");
+			const pane = await hd.splitPane(originPane, repoCwd);
+			await hd.renamePane(pane, "wb-session").catch(() => {});
+			await hd.runHerdrInPane(pane, ["session", "attach", "workbench"]);
+			booted = true;
+			// Bounded heads-up for the boot: poll the session server a few seconds, never hard-block.
+			for (let waited = 0; waited < 8_000 && !(await hd.sessionServerRunning("workbench")); waited += 500)
+				await new Promise(resolve => setTimeout(resolve, 500));
+		}
+		setStatus(`Running wb up ${target}…`);
+		const { out, err } = await wb.wbUp(target, repoCwd);
+		return wb.wbUpNotice({ out, err }, target, basename(repoCwd), booted);
+	});
+}
+
 function issueMenu(issue: gh.Issue): MenuItem[] {
 	const wbTask = wbMenuTask(issue);
+	const wbOpen = wbBadgeTask(issue);
 	return [
 		{ label: "Implement in new worktree", run: () => implementInWorktree(issue) },
 		{ label: "Implement in split pane", run: () => launchInSplit(issue, "implement") },
 		{ label: "Refine ticket with agent", run: () => launchInSplit(issue, "refine") },
 		{ label: "Slash", submenu: () => slashItems() },
+		...(wbOpen
+			? [{ label: `Open task in workbench session · wb up ${wb.wbUpTarget(wbOpen)}`, run: () => openInWorkbenchSession(wbOpen) }]
+			: []),
 		...(wbTask
 			? [
 					{ label: `Review · wb diff ${wbTask.task} (read-only)`, run: () => reviewWbTask(wbTask) },

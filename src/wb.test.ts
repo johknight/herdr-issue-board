@@ -20,6 +20,9 @@ import {
 	wbFinishArgv,
 	wbPublishArgv,
 	wbStartArgv,
+	wbUpArgv,
+	wbUpNotice,
+	wbUpTarget,
 	type PoolTask,
 } from "./wb";
 
@@ -262,5 +265,55 @@ describe("mutating argv contracts (BR-11/BR-12/BR-14)", () => {
 			expect(argv).toEqual(["wb", "finish", "issues-183-192-prototype", action, "--yes", "--json", "--repo", "/repo"]);
 			expect(argv.some(a => /push|delete|remote|prune/.test(a))).toBe(false);
 		}
+	});
+});
+
+describe("wb up targets + notices", () => {
+	test("tree-mode tasks open their own tree id", () => {
+		expect(wbUpTarget({ task: "issue-183", mode: "tree" })).toBe("issue-183");
+	});
+
+	test("serial pools open the shared serial worktree — serial sessions live in the serial tree", () => {
+		expect(wbUpTarget({ task: "issue-183", mode: "serial" })).toBe("serial");
+	});
+
+	test("wb up argv carries only the target — no mutating flag", () => {
+		expect(wbUpArgv("issue-183")).toEqual(["wb", "up", "issue-183"]);
+		expect(wbUpArgv("issue-183").some(a => /yes|push|delete/.test(a))).toBe(false);
+	});
+
+	test("a resumed run reports the opened tree, with the statusline hint", () => {
+		const r = { out: "Resuming tree-issue-183_x in pane w5:p1\n", err: null };
+		expect(wbUpNotice(r, "issue-183", "demo", false)).toBe(
+			"opened demo/issue-183 in session 'workbench' — switch sessions in the herdr statusline to see the agent tabs",
+		);
+	});
+
+	test("a run after the board booted the session points at the split pane instead", () => {
+		const r = { out: "Resuming serial_x in pane w5:p1\n", err: null };
+		expect(wbUpNotice(r, "serial", "demo", true)).toBe("opened demo/serial in session 'workbench' — booting in the wb-session split pane");
+	});
+
+	test("wb's first stderr line wins over everything", () => {
+		const r = { out: "Resuming tree-issue-183_x in pane w5:p1\n", err: "Error: wb up must run inside a git repository." };
+		expect(wbUpNotice(r, "issue-183", "demo", false)).toBe("Error: wb up must run inside a git repository.");
+	});
+
+	test("wb's own degradation lines surface with a retry hint", () => {
+		for (const line of [
+			"No sessions for issue-183 — skipping (use: wb start issue-183 <agent>).",
+			"No herdr session — resuming issue-183 manually:",
+			"No session-bearing trees to open (use: wb start <tree> <agent>).",
+		]) {
+			expect(wbUpNotice({ out: `${line}\n`, err: null }, "issue-183", "demo", false)).toBe(
+				`${line} — retry once the workbench session is up`,
+			);
+		}
+	});
+
+	test("the silent no-op of a down session degrades to a clear notice, never the success line", () => {
+		const notice = wbUpNotice({ out: "", err: null }, "issue-183", "demo", true);
+		expect(notice).not.toContain("in session 'workbench'");
+		expect(notice).toContain("wb up opened nothing");
 	});
 });

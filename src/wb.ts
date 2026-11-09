@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { listWorktrees, type Worktree } from "./prototype";
-import { run } from "./proc";
+import { CommandError, run } from "./proc";
 
 // ── task ids (derived, never configured) ─────────────────────────────────────
 
@@ -324,6 +324,52 @@ export async function wbPublish(task: string, repoRoot: string): Promise<string>
  */
 export async function wbDiff(task: string, repoRoot: string): Promise<string> {
 	return run(wbDiffArgv(task, repoRoot), repoRoot);
+}
+
+// ── wb up: open a task's tree in the workbench herdr session ────────────────
+
+/** `wb up` target of a pool task: the tree task id; serial pools open the shared `serial` worktree. */
+export function wbUpTarget(t: { task: string; mode: "tree" | "serial" }): string {
+	return t.mode === "serial" ? "serial" : t.task;
+}
+
+/** `wb up <target>` argv: materializes the target's pool tree in the workbench herdr session. */
+export function wbUpArgv(target: string): string[] {
+	return ["wb", "up", target];
+}
+
+/**
+ * Opens a task's tree in the workbench herdr session (`wb up`, non-interactive, from the repo
+ * cwd). stdout lists what opened; the first stderr line rides along as wb's own notice, and a
+ * nonzero exit throws it via run()'s CommandError contract.
+ */
+export async function wbUp(target: string, repoRoot: string): Promise<{ out: string; err: string | null }> {
+	const proc = Bun.spawn(wbUpArgv(target), { cwd: repoRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	const [out, errText, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+	if (code !== 0) throw new CommandError((errText.trim() || out.trim() || `wb up exited with ${code}`).split("\n")[0]);
+	const err = errText.trim();
+	return { out, err: err ? err.split("\n")[0] : null };
+}
+
+/**
+ * The board notice for a `wb up` run: wb's own first stderr line when it wrote one, its
+ * degradation line when nothing resumed (`wb up` no-ops silently while the workbench session
+ * is down), else the opened line — naming the split pane when the board just booted the
+ * session, the statusline hint otherwise.
+ */
+export function wbUpNotice(r: { out: string; err: string | null }, target: string, repoName: string, booted: boolean): string {
+	if (r.err) return r.err;
+	if (!/^Resuming /m.test(r.out)) {
+		const note = r.out
+			.split("\n")
+			.map(l => l.trim())
+			.find(l => /No herdr session|No sessions for|No session-bearing trees/.test(l));
+		return note
+			? `${note} — retry once the workbench session is up`
+			: "wb up opened nothing — the workbench session may still be booting; retry in a moment";
+	}
+	const tail = booted ? "booting in the wb-session split pane" : "switch sessions in the herdr statusline to see the agent tabs";
+	return `opened ${repoName}/${target} in session 'workbench' — ${tail}`;
 }
 
 /**

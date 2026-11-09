@@ -91,6 +91,32 @@ export async function splitPane(pane: string, cwd: string): Promise<string> {
 	return str(at(result, "pane", "pane_id"), "pane.pane_id");
 }
 
+/** Renames a pane — its display label in the herdr UI. */
+export async function renamePane(pane: string, label: string): Promise<void> {
+	await run([BIN, "pane", "rename", pane, label]);
+}
+
+/**
+ * Runs a herdr CLI command in a pane's own TTY (`pane run`): the pane's shell executes it with
+ * the pane's stdio and it outlives this call — the board's own pane is never taken over.
+ */
+export async function runHerdrInPane(pane: string, args: string[]): Promise<void> {
+	await run([BIN, "pane", "run", pane, BIN, ...args]);
+}
+
+/**
+ * True when the named session's server is up. `status server` exits 0 whether or not the
+ * server runs, so the JSON `running` field is the signal; any failed probe reads as down.
+ */
+export async function sessionServerRunning(session: string): Promise<boolean> {
+	try {
+		const json: unknown = JSON.parse(await run([BIN, "--session", session, "status", "server", "--json"]));
+		return !!json && typeof json === "object" && (json as Record<string, unknown>).running === true;
+	} catch {
+		return false;
+	}
+}
+
 /** Creates (or checks out) `branch` as a linked worktree workspace; returns its root pane id. */
 export async function createWorktree(cwd: string, branch: string, label: string): Promise<string> {
 	const result = await herdr(["worktree", "create", "--cwd", cwd, "--branch", branch, "--label", label, "--no-focus"]);

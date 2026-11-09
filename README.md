@@ -101,6 +101,10 @@ its pool read-only — wb stays the execution engine, the board only watches:
 - **`/wb`** — a report-style pool overview, per task: id, branch, engine (from the repo's
   `.wb.json`, `?` when unset), session count and a dirty marker. The footer prints the host commands
   you would run next (`wb diff <task>`, `wb finish <task>`) — printed, never executed.
+- **Open task in workbench session** (card `m` menu, only on badge-mapped cards) — `wb up` opens
+  the ticket's pool worktree in the `workbench` herdr session with its agent-session tabs; a down
+  session boots first in a `wb-session` split pane (the board waits a few seconds for the boot),
+  and serial pools open the shared `serial` worktree, where serial-task sessions live.
 
 Ticket ↔ task ids are derived, not configured: `issue-<n>` for a single ticket, `issues-<numbers>-<skill>`
 for a skill run over a selection (`issues-183-192-prototype`, `issues-183-185-190-refine` — the same
