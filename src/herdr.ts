@@ -2,14 +2,36 @@ import { CommandError, run } from "./proc";
 
 const BIN = process.env.HERDR_BIN_PATH ?? "herdr";
 
+/** A JSON value as `JSON.parse` produces it — the boundary type before herdr's fields are narrowed. */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/** Parses herdr stdout; malformed JSON becomes a `CommandError` naming the command. */
+function parseOutput(out: string, args: string[]): JsonValue {
+	try {
+		return JSON.parse(out) as JsonValue;
+	} catch (err) {
+		throw new CommandError(`herdr ${args.join(" ")}: unparseable JSON (${err instanceof Error ? err.message : String(err)})`);
+	}
+}
+
+/** herdr's `{error:{message}}` payload, or undefined when the JSON is not that shape. */
+function errorMessageOf(raw: string): string | undefined {
+	try {
+		const message = at(JSON.parse(raw), "error", "message");
+		return typeof message === "string" ? message : undefined;
+	} catch {
+		return undefined; // not herdr's error envelope — the original CommandError stands
+	}
+}
+
 /** Reads `path` from parsed JSON; throws when a segment is missing. */
-function at(value: unknown, ...path: string[]): unknown {
+function at(value: unknown, ...path: string[]): JsonValue {
 	let cur = value;
 	for (const key of path) {
 		if (!cur || typeof cur !== "object" || !(key in cur)) throw new CommandError(`herdr: response missing ${path.join(".")}`);
-		cur = (cur as Record<string, unknown>)[key];
+		cur = (cur as Record<string, JsonValue>)[key];
 	}
-	return cur;
+	return cur as JsonValue;
 }
 
 function str(value: unknown, path: string): string {
@@ -26,15 +48,12 @@ async function herdr(args: string[]): Promise<unknown> {
 		out = await run([BIN, ...args]);
 	} catch (err) {
 		if (err instanceof CommandError && err.message.startsWith("{")) {
-			let message: unknown;
-			try {
-				message = at(JSON.parse(err.message), "error", "message");
-			} catch {}
-			if (typeof message === "string") throw new CommandError(message);
+			const message = errorMessageOf(err.message);
+			if (message) throw new CommandError(message);
 		}
 		throw err;
 	}
-	return at(JSON.parse(out), "result");
+	return at(parseOutput(out, args), "result");
 }
 
 export type AgentInfo = {
@@ -51,7 +70,7 @@ export type AgentInfo = {
 export async function listAgents(): Promise<AgentInfo[]> {
 	const agents = at(await herdr(["agent", "list"]), "agents");
 	if (!Array.isArray(agents)) throw new CommandError("herdr: agents is not a list");
-	return agents.map((a: Record<string, unknown>) => {
+	return (agents as Record<string, unknown>[]).map(a => {
 		const paneId = str(a.pane_id, "pane_id");
 		const name = optStr(a.name);
 		return {
@@ -84,6 +103,9 @@ export async function startAgent(name: string, kind: string, pane: string): Prom
 }
 
 export async function promptAgent(target: string, text: string): Promise<void> {
+	// herdr's CLI has no "--" end-of-options marker, so a leading "-" is parsed as a flag.
+	if (text.startsWith("-"))
+		throw new CommandError(`prompt text must not start with '-' — herdr's CLI parses it as a flag; rephrase the prompt`);
 	await herdr(["agent", "prompt", target, text]);
 }
 

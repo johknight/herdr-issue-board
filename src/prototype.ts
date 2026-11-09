@@ -19,11 +19,10 @@ export async function listWorktrees(repoCwd: string): Promise<Worktree[]> {
 	return trees;
 }
 
-/** Newest worktree on a `<prefix>` branch, preferring one whose branch is for this selection range. */
+/** The `<prefix>` worktree whose branch embeds this selection range, or undefined — never a guess. */
 export function pickPrototypeWorktree(trees: Worktree[], prefix: string, range: string): Worktree | undefined {
-	const candidates = trees.filter(t => t.branch.startsWith(prefix));
 	const tail = (t: Worktree) => t.branch.slice(prefix.length);
-	return candidates.find(t => tail(t) === range || tail(t).startsWith(`${range}-`)) ?? candidates[candidates.length - 1];
+	return trees.find(t => t.branch.startsWith(prefix) && (tail(t) === range || tail(t).startsWith(`${range}-`)));
 }
 
 export type Artifact = { rel: string; abs: string; image: boolean };
@@ -38,7 +37,10 @@ export async function findArtifacts(repoRoot: string, dir: string, globs: string
 	for (const pattern of globs) {
 		try {
 			for (const rel of new Bun.Glob(pattern).scanSync({ cwd: root, onlyFiles: true })) found.add(rel);
-		} catch {}
+		} catch (err) {
+			// A configured glob that cannot be scanned silently disables part of the hand-off.
+			throw new CommandError(`could not scan "${pattern}" under ${root}: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	}
 	return [...found]
 		.filter(rel => rel.split("/").every(part => part !== "node_modules" && !part.startsWith(".")))
@@ -94,6 +96,23 @@ export function artifactComment(o: CommentInput): string {
 	].join("\n");
 }
 
-export async function commentOnIssues(cwd: string, numbers: number[], body: string): Promise<void> {
-	for (const n of numbers) await run(["gh", "issue", "comment", String(n), "--body", body], cwd);
+/**
+ * Comments on each issue in turn, attempting every issue even after a failure; on any failure it
+ * throws one honest summary naming what succeeded and what failed, instead of aborting mid-loop.
+ * Serial on purpose: `gh issue comment` is a GraphQL mutation and GitHub asks for one request at a
+ * time per user — firing N concurrently is what returns "was submitted too quickly".
+ */
+export async function commentOnIssues(cwd: string, numbers: number[], body: string, runner: typeof run = run): Promise<void> {
+	const ok: number[] = [];
+	const failed: string[] = [];
+	for (const n of numbers) {
+		try {
+			await runner(["gh", "issue", "comment", String(n), "--body", body], cwd);
+			ok.push(n);
+		} catch (err) {
+			failed.push(`failed on #${n}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+	if (failed.length)
+		throw new CommandError([...(ok.length ? [`commented on ${ok.map(n => `#${n}`).join(", ")}`] : []), ...failed].join("; "));
 }
