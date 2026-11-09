@@ -64,6 +64,8 @@ own `.agents/skills` and `.claude/skills`). The same list is on a card's `Slash`
 - `/attach` — the prototype hand-off below.
 - `/wb` — when the `wb` sandbox manager is installed: a read-only
   pool overview (see below). The entry hides itself entirely when wb is not on PATH.
+- `/plan`, `/drafts`, `/orchestrate` — the plan & orchestrate surfaces below; hidden entirely
+  while their config keys are off (the default).
 - `/<skill>` — starts that skill on the **selected tickets**: creates a worktree on
   `slash/<range>-<skill>`, starts a herdr agent in it and prompts it with the skill, the ticket list
   and the branch, so the agent keeps every artefact there and leaves `main` alone.
@@ -137,6 +139,54 @@ with a one-line notice — never a hard failure mid-selection.
 Under the default `"launcher": "herdr"` the board's flow (worktrees, `slash/*` branches, the
 automatic `/attach` push) is unchanged.
 
+## Plan & orchestrate
+
+Two optional surfaces turn the board into the cockpit for the whole work-execution loop. Both are
+off by default and hidden entirely while their config keys are unset:
+
+```json
+"plan": { "enabled": true },
+"orchestrate": { "enabled": true }
+```
+
+- **`/plan`** — start the planning loop at any stage. A submenu lists the configured
+  `plan.stages` (Spark, Grill, To spec, To tickets, Rephrase, Free-form by default — the table
+  replaces wholesale when you provide your own); pick one, type the idea or instruction at the
+  inline prompt (empty is fine when selected tickets carry the context), and a conversational
+  agent starts in a split pane with the stage prompt, the idea and the selection. One `/plan` is
+  one stage launch — the board never chains stages; you steer the agent live in its pane. Every
+  stage prompt ends with the local-fallback contract: tickets are drafted as local markdown under
+  `.scratch/<slug>/issues/` (one `<NN>-<slug>.md` per ticket in dependency order, blockers first;
+  rephrase proposals as `rephrase-<n>-<slug>.md`), and the agent does NOT touch GitHub.
+- **`/drafts`** — review what the planning agent drafted. The overlay lists every draft found
+  under `.scratch/<cluster>/issues/` (tickets as `#NN slug`, rephrases as `rephrase #n`, with
+  title, cluster and the cursor row's path). `space` toggles accept/skip (all start accepted),
+  `r` re-collects, `e` opens the file in `$EDITOR` (no `$EDITOR` → the path is copied to the
+  clipboard), `esc` returns to the board with state intact.
+- **`c` in the overlay is the only GitHub write this feature performs**: one explicit
+  `create N issues and update M tickets on <repo>? [y/N]` consent. `y` creates the accepted
+  ticket drafts as issues in `NN` order (blockers get the lower numbers) with the first column's
+  label plus `cluster-<slug>`, and applies accepted rephrase drafts as the new body of their
+  issue — bodies travel as `--body-file` paths, never argv. A label missing from the repo is
+  skipped and named in the notice, never created. Anything other than `y` — including `esc` —
+  changes nothing: "nothing created — drafts kept". Afterwards the new cards select via
+  `S` → `label:cluster-<slug>` and fan out via any `/{skill}`.
+- **`/orchestrate`** — run a sprint over the selection. Requires an explicit selection; the
+  board collects each ticket's number/title/labels/body into one context file under
+  `.scratch/orchestrate/<range>-<stamp>.md` and launches a HOST orchestrator agent in a split
+  pane whose first prompt names the file and the pipeline contract: plan first (rephrases and
+  restructuring as proposals — read-only on GitHub), dispatch workers via `wb start issue-<n>`
+  (batches as `issues-<range>-<slug>`) into wb sandboxes where badges, Review, Finish and
+  `/attach` apply unchanged, and finish only after your explicit yes. Replans are propose-only:
+  markdown in the pane and/or files under `.scratch/`, applied through the existing flows
+  (`/plan` → Rephrase, the `Refine ticket with agent` action).
+
+**Trust model:** the planning and orchestrator agents run on the host in herdr panes, supervised
+by you live — they are not sandboxed (a sandboxed orchestrator could not fan out `wb start`
+itself). Their "do not touch GitHub" instructions are prompts, not fences; the board's consent
+invariant covers board-initiated mutations only. Every GitHub mutation the board makes sits
+behind the explicit y/N above, and the only push path anywhere remains consented `wb publish`.
+
 ## Configuration
 
 `$HERDR_PLUGIN_CONFIG_DIR/config.json` overlays the defaults (`columns` replaces, everything else merges):
@@ -171,6 +221,8 @@ Prompt placeholders — `implement`/`refine`: `{number} {title} {repo} {url} {br
 | `src/skills.ts` | `SKILL.md` discovery |
 | `src/prototype.ts` | worktree lookup, artefact publish, ticket comments |
 | `src/wb.ts` | wb adapter: pool worktrees, sessions, `.wb.json`, task-id mapping, launcher + `wb start/publish/diff/finish` wiring |
+| `src/drafts.ts` | to-tickets local-draft scan + parse (the `/drafts` data source) |
+| `src/orchestrate.ts` | orchestrator context builder + `.scratch/orchestrate/` context files |
 | `src/github.ts` | `gh` wrappers (issues, labels, detail) |
 | `src/herdr.ts` | `herdr` CLI wrappers (panes, worktrees, agents) |
 | `src/proc.ts` | process + clipboard helpers |

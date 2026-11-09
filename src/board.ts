@@ -1,9 +1,11 @@
 // Kanban board of a repo's open GitHub issues, rendered as a full-screen terminal app inside a herdr pane.
 // Columns come from labels (config.ts). Right-click or `m` on a card opens actions that hand the ticket to agents.
 import { basename, join } from "node:path";
-import { type ColumnSpec, type Config, fill, loadConfig } from "./config";
+import { type ColumnSpec, type Config, fill, loadConfig, type PlanStage } from "./config";
+import { collectDrafts, consentSummary, type Draft } from "./drafts";
 import * as gh from "./github";
 import * as hd from "./herdr";
+import { collectTicketContexts, contextFilePath, orchestrateContext } from "./orchestrate";
 import { copyToClipboard, run } from "./proc";
 import * as proto from "./prototype";
 import { ago, blocksToMarkdown, buildReport, type Block, reportPrompt } from "./report";
@@ -160,6 +162,20 @@ let wbByIssue = new Map<number, wb.PoolTask>();
 let wbView: WbView | null = null;
 /** BR-14 Review: the task diff rendered in a scrollable, read-only overlay. */
 let wbDiffView: { task: string; lines: string[]; scroll: number } | null = null;
+/** `/drafts` overlay: to-tickets local drafts with per-draft accept/skip and one consented commit. */
+type DraftsView = {
+	drafts: Draft[];
+	/** Accepted draft paths — every draft starts accepted, `space` toggles. */
+	accepted: Set<string>;
+	/** Every draft path ever collected — only first-seen paths start accepted, skips stick. */
+	seen: Set<string>;
+	cursor: number;
+	loading: boolean;
+	scroll: number;
+};
+let draftsView: DraftsView | null = null;
+/** True while `$EDITOR` owns the terminal (the `e` suspend): render and input stay off until it exits. */
+let suspended = false;
 /**
  * BR-12 consent context once `/attach` has committed locally: the consent prompt asks about
  * pushing, and `finishAttach` (from the prompt's y/N) publishes via `wb publish` or comments only.
@@ -383,7 +399,7 @@ function renderMenu(m: Menu, L: Layout): string {
 }
 
 function render() {
-	if (!process.stdout.isTTY) return;
+	if (suspended || !process.stdout.isTTY) return;
 	const L = layout();
 	const rows: string[] = new Array(L.H).fill("");
 	cardHits = [];
@@ -393,6 +409,7 @@ function render() {
 	if (reportView) renderReport(L, rows);
 	else if (wbView) renderWbView(L, rows);
 	else if (wbDiffView) renderWbDiff(L, rows);
+	else if (draftsView) renderDrafts(L, rows);
 	else if (detail) renderDetail(L, rows);
 	else renderBoard(L, rows);
 	if (input) {
@@ -831,6 +848,15 @@ function slashItems(): MenuItem[] {
 		{ label: "/report · local summary of the selection", run: () => openReport(undefined) },
 		{ label: "/select · pick tickets by range, label or assignee", run: () => openSelectPrompt() },
 		{ label: "/attach · post prototype screenshots on the tickets", run: () => attachPrototype() },
+		...(config.plan.enabled
+			? [
+					{ label: "/plan · start the planning loop at any stage", run: () => openPlanMenu() },
+					{ label: "/drafts · review agent-drafted tickets", run: () => openDraftsView() },
+				]
+			: []),
+		...(config.orchestrate.enabled
+			? [{ label: "/orchestrate · run a sprint over the selection", run: () => orchestrateSelection() }]
+			: []),
 		...(wbReady ? [{ label: "/wb · read-only overview of the wb pool", run: () => openWbView() }] : []),
 		{ label: `${skills.length} global skills`, disabled: true },
 		...skills.map(s => ({
@@ -1034,6 +1060,244 @@ function renderWbDiff(L: Layout, rows: string[]) {
 	rows[2] = dim("─".repeat(W));
 	v.scroll = clamp(v.scroll, 0, Math.max(0, v.lines.length - bodyH));
 	for (let y = 0; y < bodyH; y++) rows[BODY_TOP + y] = ` ${truncate(v.lines[v.scroll + y] ?? "", W - 2)}`;
+}
+
+// ── /plan + /drafts + /orchestrate: planning loop, drafts review, sprint launch ─
+
+/** `/plan`: the config stage table as a submenu — one stage, one prompt-with-context launch. */
+function openPlanMenu() {
+	const items: MenuItem[] = config.plan.stages.map(stage => ({
+		label: `${stage.name}${stage.description ? ` · ${truncate(stage.description, 44)}` : ""}`,
+		run: () => promptPlanIdea(stage),
+	}));
+	menu = { title: "/plan stages", items, index: firstEnabled(items), offset: 0, x: 2, y: BODY_TOP, parent: null };
+	render();
+}
+
+/** The stage's inline idea prompt — empty allowed when the selection carries the context. */
+function promptPlanIdea(stage: PlanStage) {
+	input = {
+		label: "idea or instruction —",
+		buffer: "",
+		apply: text => void launchPlanStage(stage, text),
+	};
+	render();
+}
+
+/**
+ * One `/plan` launch = one stage: a conversational HOST agent in a split pane (no worktree, no
+ * sandbox — the `reportInSplit` precedent) carrying the stage prompt, the idea and the selection.
+ * The board never chains stages; adapting course = steering the agent or picking another stage.
+ */
+function launchPlanStage(stage: PlanStage, idea: string) {
+	const picks = pickedIssues(false);
+	if (!idea.trim() && !picks.length) return setStatus("Type an idea or select tickets first", YELLOW);
+	return act(`Starting plan · ${stage.name}`, async () => {
+		if (!originPane) throw new Error("no origin pane to split (open the board via its action)");
+		const skill = stage.skill ? skills.find(s => s.name === stage.skill) : undefined;
+		const prompt = fill(stage.prompt, {
+			idea,
+			repo,
+			selection: picks.map(i => `#${i.number} ${i.title}`).join("\n"),
+			skillPath: skill?.path ?? "",
+		});
+		const pane = await hd.splitPane(originPane, repoCwd);
+		const started = await launchNamed(`plan-${slug(stage.name)}`, pane, prompt);
+		return `${started} — drafts land under .scratch/<slug>/issues/ — /drafts to review`;
+	});
+}
+
+/** `/drafts`: collect on open (`r` re-collects); every draft starts accepted. */
+function openDraftsView() {
+	draftsView = { drafts: [], accepted: new Set(), seen: new Set(), cursor: 0, loading: true, scroll: 0 };
+	menu = null;
+	render();
+	void reloadDrafts();
+}
+
+/** Re-collects the drafts, keeping existing accept/skip choices; only first-seen paths start accepted. */
+async function reloadDrafts() {
+	const v = draftsView;
+	if (!v) return;
+	v.loading = true;
+	render();
+	v.drafts = await collectDrafts(repoCwd);
+	for (const d of v.drafts) {
+		if (v.seen.has(d.path)) continue; // an explicitly skipped draft is never re-accepted
+		v.seen.add(d.path);
+		v.accepted.add(d.path);
+	}
+	v.cursor = clamp(v.cursor, 0, Math.max(0, v.drafts.length - 1));
+	v.loading = false;
+	render();
+}
+
+/** Body lines of the `/drafts` overlay; no drafts degrade to a one-line note. */
+function draftsViewLines(v: DraftsView, w: number): string[] {
+	if (v.loading) return [dim("Collecting drafts…")];
+	if (!v.drafts.length) return [dim("no drafts under .scratch/<cluster>/issues/ — run /plan, then r")];
+	const out: string[] = [];
+	v.drafts.forEach((d, i) => {
+		const mark = v.accepted.has(d.path) ? "✓" : "·";
+		const id = d.kind === "ticket" ? `#${String(d.nn).padStart(2, "0")} ${d.slug}` : `rephrase #${d.issue}`;
+		const pre = i === v.cursor ? INV : "";
+		out.push(`${pre}${mark} ${bold(fit(clean(id), w - 2))}${RESET}`);
+		const meta = [...(d.kind === "ticket" ? [clean(d.title)] : []), `cluster ${clean(d.cluster)}`].join(" · ");
+		out.push(`${pre}${dim(fit(`  ${meta}`, w))}${RESET}`);
+	});
+	return out;
+}
+
+function renderDrafts(L: Layout, rows: string[]) {
+	const v = draftsView as DraftsView;
+	const { W, bodyH } = L;
+	v.cursor = clamp(v.cursor, 0, Math.max(0, v.drafts.length - 1));
+	const right = "space accept · e edit · c create/update · r reload · j/k move · esc back";
+	rows[0] = headerLine(W, ` drafts · ${v.drafts.length} draft${v.drafts.length === 1 ? "" : "s"}`, right);
+	const cur = v.drafts[v.cursor];
+	rows[1] = dim(fit(` ${repo || "…"}${cur ? ` · ${clean(cur.path)}` : ""}`, W));
+	rows[2] = dim("─".repeat(W));
+	const lines = draftsViewLines(v, W - 2);
+	const top = v.cursor * 2;
+	if (top < v.scroll) v.scroll = top;
+	if (top + 2 > v.scroll + bodyH) v.scroll = top + 2 - bodyH;
+	v.scroll = clamp(v.scroll, 0, Math.max(0, lines.length - bodyH));
+	for (let y = 0; y < bodyH; y++) rows[BODY_TOP + y] = ` ${lines[v.scroll + y] ?? ""}`;
+}
+
+/** `space`: toggle the cursor row's accept/skip (drafts are identified by their path). */
+function toggleDraftAccept() {
+	const v = draftsView;
+	const d = v?.drafts[v.cursor];
+	if (!v || !d) return;
+	if (v.accepted.has(d.path)) v.accepted.delete(d.path);
+	else v.accepted.add(d.path);
+}
+
+/**
+ * `e`: the `$EDITOR` suspend dance — leave the alt screen and raw mode, run the editor with
+ * inherited stdio on the draft file, then restore the board and re-collect (the file may have
+ * changed). No `$EDITOR` → the path lands on the clipboard with a notice.
+ */
+async function editDraftFile() {
+	const v = draftsView;
+	const d = v?.drafts[v.cursor];
+	if (!v || !d) return;
+	const file = join(repoCwd, d.path);
+	const editor = process.env.EDITOR;
+	if (!editor) {
+		try {
+			await copyToClipboard(file);
+			setStatus(`No $EDITOR — copied the draft path: ${file}`, YELLOW);
+		} catch {
+			setStatus(`No $EDITOR — draft file: ${file}`, YELLOW);
+		}
+		return;
+	}
+	suspended = true;
+	process.stdin.pause();
+	process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+	if (process.stdin.isTTY) process.stdin.setRawMode(false);
+	try {
+		const proc = Bun.spawn([...editor.split(/\s+/).filter(Boolean), file], {
+			cwd: repoCwd,
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+		});
+		await proc.exited;
+	} catch {
+		// the restore below is the important part — the notice slot shows nothing was edited
+	}
+	if (process.stdin.isTTY) process.stdin.setRawMode(true);
+	process.stdin.resume();
+	process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J");
+	suspended = false;
+	await reloadDrafts();
+}
+
+/**
+ * `c` in the overlay: the single y/N consent (the BR-12 precedent) in front of every GitHub
+ * mutation this feature makes — yes runs the create/edit commit, anything else keeps the drafts.
+ */
+function openDraftsConsent() {
+	const v = draftsView;
+	if (!v) return;
+	if (!v.drafts.some(d => v.accepted.has(d.path))) return setStatus("No drafts accepted — space toggles a draft", YELLOW);
+	input = {
+		label: `${consentSummary(v.drafts, v.accepted)} on ${repo}? [y/N]`,
+		buffer: "",
+		apply: text => {
+			if (wb.consentAnswer(text)) void commitDrafts();
+			else setStatus("nothing created — drafts kept", YELLOW);
+		},
+	};
+	render();
+}
+
+/**
+ * The consented commit — the board's only `createIssue`/`editIssueBody` call site. Tickets are
+ * created in `nn` order (blockers get lower numbers) with the column + cluster labels filtered by
+ * the read-only `listLabels` preflight (missing labels are skipped and named, never created);
+ * rephrase drafts replace their issue's body. Bodies travel as `--body-file` paths, never argv.
+ */
+function commitDrafts() {
+	return act("Committing drafts", async () => {
+		const v = draftsView;
+		if (!v) throw new Error("drafts view closed");
+		const existing = new Set(await gh.listLabels(repoCwd));
+		const columnLabel = config.columns[0]?.label;
+		const skipped = new Set<string>();
+		const created: number[] = [];
+		const updated: number[] = [];
+		for (const d of v.drafts) {
+			if (!v.accepted.has(d.path)) continue;
+			if (d.kind === "ticket") {
+				const wanted = [columnLabel, `${config.plan.clusterLabelPrefix}${d.cluster}`].filter((l): l is string => !!l);
+				const labels = wanted.filter(l => existing.has(l));
+				for (const l of wanted) if (!existing.has(l)) skipped.add(l);
+				created.push(await gh.createIssue(repoCwd, d.title, join(repoCwd, d.path), labels));
+			} else {
+				await gh.editIssueBody(repoCwd, d.issue, join(repoCwd, d.path));
+				updated.push(d.issue);
+			}
+		}
+		await loadIssues(true);
+		const parts = [
+			created.length ? `created ${created.map(n => `#${n}`).join(" ")}` : "",
+			updated.length ? `updated ${updated.map(n => `#${n}`).join(" ")}` : "",
+			skipped.size ? `labels skipped (not on repo): ${[...skipped].join(", ")}` : "",
+		].filter(Boolean);
+		return parts.join(" · ") || "nothing to do";
+	});
+}
+
+/**
+ * `/orchestrate`: the selection's bodies into one context file, then a HOST orchestrator agent in
+ * a split pane with the pipeline-contract prompt (plan first, read-only on GitHub, wb dispatch,
+ * consented finish). The board adds no wb wrappers — the orchestrator fans out `wb start` itself.
+ */
+function orchestrateSelection() {
+	const picks = pickedIssues(false);
+	if (!picks.length) return setStatus("Select tickets first (space or /select), then run a slash command", YELLOW);
+	const numbers = picks.map(i => i.number);
+	const range = rangeLabel(numbers);
+	return act(`Orchestrating ${numbers.length} ticket${numbers.length === 1 ? "" : "s"}`, async () => {
+		if (!originPane) throw new Error("no origin pane to split (open the board via its action)");
+		const contexts = await collectTicketContexts(repoCwd, picks);
+		const file = contextFilePath(repoCwd, range);
+		await Bun.write(file, orchestrateContext(repo, contexts));
+		const prompt = fill(config.prompts.orchestrate, {
+			repo,
+			tickets: numbers.map(n => `#${n}`).join(", "),
+			list: picks.map(i => `- #${i.number} ${i.title} (${i.url})`).join("\n"),
+			range,
+			contextFile: file,
+		});
+		const pane = await hd.splitPane(originPane, repoCwd);
+		const started = await launchNamed(`orchestrate-${range}`, pane, prompt);
+		return `${started} — context: ${file}`;
+	});
 }
 
 // ── skills: run in a fresh worktree, then publish the prototype back ────────
@@ -1251,6 +1515,22 @@ function onKey(key: string) {
 		else if (key === "G" || key === "end") v.scroll = Number.MAX_SAFE_INTEGER;
 		return render();
 	}
+	if (draftsView) {
+		const v = draftsView;
+		const page = Math.max(1, layout().bodyH - 2);
+		if (key === "esc" || key === "q" || key === "backspace" || key === "h" || key === "left") draftsView = null;
+		else if (key === "down" || key === "j") v.cursor++;
+		else if (key === "up" || key === "k") v.cursor--;
+		else if (key === "pgdn") v.cursor += page;
+		else if (key === "pgup") v.cursor -= page;
+		else if (key === "g" || key === "home") v.cursor = 0;
+		else if (key === "G" || key === "end") v.cursor = Number.MAX_SAFE_INTEGER;
+		else if (key === " ") toggleDraftAccept();
+		else if (key === "r") return void reloadDrafts();
+		else if (key === "e") return void editDraftFile();
+		else if (key === "c") return openDraftsConsent();
+		return render();
+	}
 	if (detail) {
 		const page = Math.max(1, layout().bodyH - 2);
 		if (key === "esc" || key === "q" || key === "backspace" || key === "h" || key === "left") detail = null;
@@ -1346,6 +1626,10 @@ function onMouse(button: number, x: number, y: number) {
 			wbDiffView.scroll += wheel * 3;
 			return render();
 		}
+		if (draftsView) {
+			draftsView.cursor += wheel * 3;
+			return render();
+		}
 		if (detail) {
 			detail.scroll += wheel * 3;
 			return render();
@@ -1373,6 +1657,7 @@ function onMouse(button: number, x: number, y: number) {
 	if (reportView) return;
 	if (wbView) return;
 	if (wbDiffView) return;
+	if (draftsView) return;
 	if (detail) {
 		if (btn === 2) openMenu(detail.issue, x, y);
 		return;
@@ -1397,6 +1682,7 @@ function csiKey(params: string, final: string): string {
 }
 
 function onData(data: string) {
+	if (suspended) return; // editor keystrokes must never reach onKey, even if pause ever fails
 	let i = 0;
 	while (i < data.length) {
 		const rest = data.slice(i);
